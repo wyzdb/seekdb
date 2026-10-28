@@ -1511,6 +1511,19 @@
     "background_cn": "",
     "ref_url": ""
   },
+  "enable_file_sql": {
+    "id": 10754,
+    "name": "enable_file_sql",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "enable reading local CSV/JSONL/Parquet files as tables",
+    "flags": "GLOBAL | SESSION | INFLUENCE_PLAN | NEED_SERIALIZE",
+    "publish_version": "",
+    "info_cn": "\u5f00\u542f\u540e\u5141\u8bb8 read_csv/read_json/read_parquet \u8bfb\u53d6\u672c\u5730\u6587\u4ef6",
+    "background_cn": "",
+    "ref_url": ""
+  },
   "ob_enable_transformation": {
     "id": 10007,
     "name": "ob_enable_transformation",

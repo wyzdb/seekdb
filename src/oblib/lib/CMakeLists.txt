@@ -84,10 +84,10 @@ else()
 
   if(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
     target_link_libraries(oblib_lib PUBLIC
-      libcpuinfo.a
-      libsimd.a
-      libvsag_static.a
       libdiskann.a
+      libvsag_static.a
+      libsimd.a
+      libcpuinfo.a
       libopenblas.a
       libgfortran_static.a
       libquadmath_static.a
@@ -98,10 +98,10 @@ else()
       libfmt.a)
   elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
     target_link_libraries(oblib_lib PUBLIC
-      libcpuinfo.a
-      libsimd.a
-      libvsag_static.a
       libdiskann.a
+      libvsag_static.a
+      libsimd.a
+      libcpuinfo.a
       libopenblas.a
       libgfortran_static.a
       libgomp_static.a
@@ -111,10 +111,10 @@ else()
       libfmt.a)
   elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
     target_link_libraries(oblib_lib PUBLIC
-      libcpuinfo.a
-      libsimd.a
-      libvsag_static.a
       libdiskann.a
+      libvsag_static.a
+      libsimd.a
+      libcpuinfo.a
       libio.a
       libroaring.a
       libantlr4-runtime.a

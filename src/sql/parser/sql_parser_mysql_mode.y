@@ -57,6 +57,8 @@
 %destructor {destroy_tree($$);}<node>
 %destructor {oceanbase::common::ob_free($$);}<str_value_>
 
+%expect 8
+
 %token <node> NAME_OB
 %token <node> STRING_VALUE
 %token <node> NATIONAL_LITERAL
@@ -497,7 +499,7 @@ END_P SET_VAR DELIMITER
 %type <node> dynamic_sampling_hint
 %type <node> skip_index_type opt_skip_index_type_list
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
-%type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
+%type <node> json_table_expr file_table_expr file_table_arg_list file_table_alias unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
 %type <node> table_values_clause table_values_clause_with_order_by_and_limit values_row_list row_value
@@ -10835,6 +10837,10 @@ tbl_name
 {
   $$ = $1;
 }
+| file_table_expr
+{
+  $$ = $1;
+}
 | '(' table_references ')'
 {
   $$ = $2;
@@ -16616,6 +16622,66 @@ DAY
   $$->is_hidden_const_ = 1;
   $$->is_date_unit_ = 1;
   dup_expr_string($$, result, @1.first_column, @1.last_column);
+}
+;
+
+/*===========================================================
+*
+*  FILE TABLE (read_csv/read_json/read_ndjson/read_parquet/glob)
+*
+*============================================================*/
+file_table_expr:
+relation_factor '(' file_table_arg_list ')' file_table_alias
+{
+  ParseNode *alias_node = NULL;
+  ParseNode *col_alias_node = NULL;
+  if (NULL != $5) {
+    alias_node = $5->children_[0];
+    col_alias_node = $5->children_[1];
+  }
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3,
+                           $3, alias_node, col_alias_node);
+  if (NULL != $$ && NULL != $1 && $1->num_child_ > 1 && NULL != $1->children_[1]) {
+    dup_node_string($1->children_[1], $$, result->malloc_pool_);
+  }
+}
+;
+
+file_table_arg_list:
+expr
+{
+  $$ = $1;
+}
+| file_table_arg_list ',' expr
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+file_table_alias:
+/*empty*/
+{
+  $$ = NULL;
+}
+| relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, NULL);
+}
+| AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $2, NULL);
+}
+| relation_name '(' alias_name_list ')'
+{
+  ParseNode *cols = NULL;
+  merge_nodes(cols, result, T_COLUMN_LIST, $3);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, cols);
+}
+| AS relation_name '(' alias_name_list ')'
+{
+  ParseNode *cols = NULL;
+  merge_nodes(cols, result, T_COLUMN_LIST, $4);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $2, cols);
 }
 ;
 
