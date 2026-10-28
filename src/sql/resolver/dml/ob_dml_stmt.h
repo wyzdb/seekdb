@@ -101,6 +101,78 @@ typedef struct ObJsonTableDef {
   common::ObSEArray<ObString, 16, common::ModulePageAllocator, true> namespace_arr_;
 } ObJsonTableDef;
 
+
+enum class ObFileFormat : uint8_t {
+  FILE_CSV = 0,
+  FILE_JSONL,
+  FILE_NDJSON,
+  FILE_PARQUET,
+  FILE_GLOB,
+};
+
+enum class ObFileColType : uint8_t {
+  FILE_COL_NULL = 0,
+  FILE_COL_BOOLEAN,
+  FILE_COL_BIGINT,
+  FILE_COL_DOUBLE,
+  FILE_COL_VARCHAR,
+  FILE_COL_DATE,
+  FILE_COL_DATETIME,
+};
+
+struct ObFileColumn {
+  ObFileColumn()
+    : name_(), type_(ObFileColType::FILE_COL_VARCHAR), nullable_(true),
+      length_(0), scale_(0) {}
+  common::ObString name_;
+  ObFileColType type_;
+  bool nullable_;
+  int32_t length_;
+  int32_t scale_;
+  TO_STRING_KV(K_(name), K_(type), K_(nullable), K_(length), K_(scale));
+};
+
+struct ObFileOptions {
+  ObFileOptions()
+    : header_set_(false), header_(false), delimiter_(','), quote_('"'),
+      escape_('"'), nullstr_(), sample_size_(-1), filename_(false),
+      union_by_name_(true) {}
+  bool header_set_;
+  bool header_;
+  char delimiter_;
+  char quote_;
+  char escape_;
+  common::ObString nullstr_;
+  int64_t sample_size_;
+  bool filename_;
+  bool union_by_name_;
+};
+
+struct ObFileFingerprint {
+  ObFileFingerprint()
+    : dev_(0), ino_(0), size_(0), mtime_sec_(0), mtime_nsec_(0), valid_(false) {}
+  int64_t dev_;
+  int64_t ino_;
+  int64_t size_;
+  int64_t mtime_sec_;
+  int64_t mtime_nsec_;
+  bool valid_;
+};
+
+struct ObFileTableDef {
+  ObFileTableDef()
+    : format_(ObFileFormat::FILE_CSV), path_(), opts_(), cols_(), fp_(),
+      row_count_(0), is_glob_(false), glob_files_() {}
+  ObFileFormat format_;
+  common::ObString path_;
+  ObFileOptions opts_;
+  common::ObSEArray<ObFileColumn, 8, common::ModulePageAllocator, true> cols_;
+  ObFileFingerprint fp_;
+  int64_t row_count_;
+  bool is_glob_;
+  common::ObSEArray<common::ObString, 8, common::ModulePageAllocator, true> glob_files_;
+};
+
 struct ObValuesTableDef {
   ObValuesTableDef() : start_param_idx_(-1), end_param_idx_(-1), column_cnt_(0), row_cnt_(0),
                        access_type_(ACCESS_EXPR), is_const_(false) {}
@@ -153,6 +225,7 @@ struct TableItem
     ddl_schema_version_ = 0;
     ddl_table_id_ = common::OB_INVALID_ID;
     json_table_def_ = nullptr;
+    file_table_def_ = nullptr;
     table_type_ = MAX_TABLE_TYPE;
     values_table_def_ = NULL;
     sample_info_ = nullptr;
@@ -188,6 +261,7 @@ struct TableItem
     TRANSPOSE_TABLE,
     TEMP_TABLE,
     JSON_TABLE,
+    FILE_TABLE,
     VALUES_TABLE,
     LATERAL_TABLE,
   };
@@ -222,7 +296,8 @@ struct TableItem
   bool is_has_sample_info() const { return sample_info_ != nullptr; }
   bool is_joined_table() const { return JOINED_TABLE == type_; }
   bool is_function_table() const { return FUNCTION_TABLE == type_; }
-  bool is_json_table() const { return JSON_TABLE == type_; }  // json_table_def_->table_type_ == MulModeTableType::OB_ORA_JSON_TABLE_TYPE
+  bool is_json_table() const { return JSON_TABLE == type_; }
+  bool is_file_table() const { return FILE_TABLE == type_; }  // json_table_def_->table_type_ == MulModeTableType::OB_ORA_JSON_TABLE_TYPE
   bool is_values_table() const { return VALUES_TABLE == type_; }//used to mark values statement: values row(1,2), row(3,4);
 
   bool is_lateral_table() const { return LATERAL_TABLE == type_; }
@@ -301,6 +376,8 @@ struct TableItem
   common::ObSEArray<ObExecParamRawExpr*, 4, common::ModulePageAllocator, true> exec_params_;
   // json table
   ObJsonTableDef *json_table_def_;
+  // file table
+  ObFileTableDef *file_table_def_;
   // values table
   ObValuesTableDef *values_table_def_;
   // sample scan infos

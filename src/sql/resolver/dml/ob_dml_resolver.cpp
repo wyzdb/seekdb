@@ -41,6 +41,16 @@
 #include "sql/resolver/dcl/ob_dcl_resolver.h"
 #include "sql/resolver/ddl/ob_ddl_resolver.h"
 #include "sql/hybrid_search/ob_hybrid_search_executor.h"
+#include <sys/stat.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <ctype.h>
+#include <string>
+#include <vector>
+#include <functional>
+#include <algorithm>
+
 
 namespace oceanbase
 {
@@ -3770,25 +3780,719 @@ int ObDMLResolver::resolve_hybrid_search_item(const ParseNode &parse_tree, Table
   return ret;
 }
 
+
+namespace {
+
+struct FileCsvColState {
+  ObFileColType type_;
+  bool nullable_;
+  int64_t max_len_;
+  FileCsvColState() : type_(ObFileColType::FILE_COL_NULL), nullable_(false), max_len_(0) {}
+};
+
+static bool file_is_leap_year(int64_t y)
+{
+  return (0 == y % 4 && 0 != y % 100) || 0 == y % 400;
+}
+
+static int64_t file_days_in_month(int64_t y, int64_t m)
+{
+  static const int64_t dim[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  int64_t d = (m >= 1 && m <= 12) ? dim[m - 1] : 0;
+  if (2 == m && file_is_leap_year(y)) {
+    d = 29;
+  }
+  return d;
+}
+
+static bool file_parse_date(const std::string &s, int64_t &y, int64_t &m, int64_t &d)
+{
+  bool ok = false;
+  if (s.size() == 10 && '-' == s[4] && '-' == s[7] &&
+      isdigit((unsigned char)s[0]) && isdigit((unsigned char)s[1]) &&
+      isdigit((unsigned char)s[2]) && isdigit((unsigned char)s[3]) &&
+      isdigit((unsigned char)s[5]) && isdigit((unsigned char)s[6]) &&
+      isdigit((unsigned char)s[8]) && isdigit((unsigned char)s[9])) {
+    y = (s[0] - '0') * 1000 + (s[1] - '0') * 100 + (s[2] - '0') * 10 + (s[3] - '0');
+    m = (s[5] - '0') * 10 + (s[6] - '0');
+    d = (s[8] - '0') * 10 + (s[9] - '0');
+    ok = (y >= 1 && y <= 9999 && m >= 1 && m <= 12 && d >= 1 && d <= file_days_in_month(y, m));
+  }
+  return ok;
+}
+
+static bool file_parse_datetime(const std::string &s)
+{
+  bool ok = false;
+  int64_t y = 0, m = 0, d = 0;
+  if (s.size() >= 19 && (' ' == s[10] || 'T' == s[10]) && ':' == s[13] && ':' == s[16]) {
+    std::string date_part = s.substr(0, 10);
+    if (file_parse_date(date_part, y, m, d)) {
+      int64_t hh = (s[11] - '0') * 10 + (s[12] - '0');
+      int64_t mm = (s[14] - '0') * 10 + (s[15] - '0');
+      int64_t ss = (s[17] - '0') * 10 + (s[18] - '0');
+      bool digits = true;
+      for (int64_t i = 11; i < 19; ++i) {
+        if (i != 13 && i != 16 && !isdigit((unsigned char)s[i])) { digits = false; break; }
+      }
+      bool frac_ok = true;
+      if (digits && s.size() > 19) {
+        if ('.' != s[19]) {
+          frac_ok = false;
+        } else {
+          for (size_t i = 20; i < s.size(); ++i) {
+            if (!isdigit((unsigned char)s[i])) { frac_ok = false; break; }
+          }
+        }
+      }
+      ok = digits && frac_ok && hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59 && ss >= 0 && ss <= 59;
+    }
+  }
+  return ok;
+}
+
+static bool file_is_integer(const std::string &s, bool &overflow)
+{
+  overflow = false;
+  if (s.empty()) return false;
+  size_t i = 0;
+  if ('+' == s[0] || '-' == s[0]) i = 1;
+  if (i >= s.size()) return false;
+  for (size_t j = i; j < s.size(); ++j) {
+    if (!isdigit((unsigned char)s[j])) return false;
+  }
+  errno = 0;
+  char *end = NULL;
+  (void)strtoll(s.c_str(), &end, 10);
+  if (ERANGE == errno) overflow = true;
+  return true;
+}
+
+static bool file_is_double(const std::string &s)
+{
+  if (s.empty()) return false;
+  size_t i = 0;
+  if ('+' == s[0] || '-' == s[0]) i = 1;
+  bool digit = false, dot = false, exp = false;
+  for (; i < s.size(); ++i) {
+    char c = s[i];
+    if (isdigit((unsigned char)c)) { digit = true; continue; }
+    if ('.' == c && !dot && !exp) { dot = true; continue; }
+    if (('e' == c || 'E' == c) && digit && !exp) {
+      exp = true;
+      if (i + 1 < s.size() && ('+' == s[i + 1] || '-' == s[i + 1])) ++i;
+      continue;
+    }
+    return false;
+  }
+  return digit;
+}
+
+static std::string file_lower(const std::string &s)
+{
+  std::string r(s);
+  for (size_t i = 0; i < r.size(); ++i) r[i] = (char)tolower((unsigned char)r[i]);
+  return r;
+}
+
+static ObFileColType file_detect_type(const std::string &s, bool quoted, bool &is_null)
+{
+  ObFileColType t = ObFileColType::FILE_COL_VARCHAR;
+  is_null = false;
+  if (!quoted && s.empty()) {
+    is_null = true;
+    t = ObFileColType::FILE_COL_NULL;
+  } else if (!quoted && (0 == file_lower(s).compare("null"))) {
+    is_null = true;
+    t = ObFileColType::FILE_COL_NULL;
+  } else if (quoted && s.empty()) {
+    t = ObFileColType::FILE_COL_VARCHAR;
+  } else {
+    std::string low = file_lower(s);
+    if (0 == low.compare("true") || 0 == low.compare("false")) {
+      t = ObFileColType::FILE_COL_BOOLEAN;
+    } else {
+      bool overflow = false;
+      if (file_is_integer(s, overflow)) {
+        t = overflow ? ObFileColType::FILE_COL_DOUBLE : ObFileColType::FILE_COL_BIGINT;
+      } else if (file_is_double(s)) {
+        t = ObFileColType::FILE_COL_DOUBLE;
+      } else if (file_parse_datetime(s)) {
+        t = ObFileColType::FILE_COL_DATETIME;
+      } else {
+        int64_t y = 0, m = 0, d = 0;
+        if (file_parse_date(s, y, m, d)) {
+          t = ObFileColType::FILE_COL_DATE;
+        } else {
+          t = ObFileColType::FILE_COL_VARCHAR;
+        }
+      }
+    }
+  }
+  return t;
+}
+
+static ObFileColType file_widen_type(ObFileColType a, ObFileColType b)
+{
+  if (ObFileColType::FILE_COL_NULL == a) return b;
+  if (ObFileColType::FILE_COL_NULL == b) return a;
+  if (a == b) return a;
+  if (ObFileColType::FILE_COL_VARCHAR == a || ObFileColType::FILE_COL_VARCHAR == b) {
+    return ObFileColType::FILE_COL_VARCHAR;
+  }
+  if (ObFileColType::FILE_COL_DOUBLE == a || ObFileColType::FILE_COL_DOUBLE == b) {
+    return ObFileColType::FILE_COL_DOUBLE;
+  }
+  if ((ObFileColType::FILE_COL_BOOLEAN == a && ObFileColType::FILE_COL_BIGINT == b) ||
+      (ObFileColType::FILE_COL_BIGINT == a && ObFileColType::FILE_COL_BOOLEAN == b)) {
+    return ObFileColType::FILE_COL_BIGINT;
+  }
+  if ((ObFileColType::FILE_COL_DATE == a && ObFileColType::FILE_COL_DATETIME == b) ||
+      (ObFileColType::FILE_COL_DATETIME == a && ObFileColType::FILE_COL_DATE == b)) {
+    return ObFileColType::FILE_COL_DATETIME;
+  }
+  return ObFileColType::FILE_COL_VARCHAR;
+}
+
+static int file_scan_csv(const std::string &path,
+                         const ObFileOptions &opts,
+                         const std::function<int(const std::vector<std::string> &,
+                                                 const std::vector<bool> &,
+                                                 int64_t)> &on_row)
+{
+  int ret = OB_SUCCESS;
+  FILE *fp = fopen(path.c_str(), "rb");
+  if (NULL == fp) {
+    ret = OB_FILE_NOT_EXIST;
+    LOG_WARN("open csv file failed", K(ret), K(path.c_str()), K(errno));
+  } else {
+    std::string field;
+    std::vector<std::string> row;
+    std::vector<bool> quoted;
+    bool in_quotes = false;
+    bool field_started = false;
+    bool field_quoted = false;
+    int64_t line_no = 1;
+    bool first_char = true;
+    int c = 0;
+    while (OB_SUCC(ret) && EOF != (c = fgetc(fp))) {
+      if (first_char) {
+        first_char = false;
+        if (0xEF == (unsigned char)c) {
+          int c2 = fgetc(fp);
+          int c3 = fgetc(fp);
+          if (0xBB == (unsigned char)c2 && 0xBF == (unsigned char)c3) {
+            continue;
+          }
+          if (EOF != c2) ungetc(c2, fp);
+          if (EOF != c3) ungetc(c3, fp);
+        }
+      }
+      if (in_quotes) {
+        if ('"' == c) {
+          int n = fgetc(fp);
+          if ('"' == n) {
+            field.push_back('"');
+          } else {
+            in_quotes = false;
+            if (EOF != n) ungetc(n, fp);
+          }
+        } else {
+          field.push_back((char)c);
+          if ('\n' == c) ++line_no;
+        }
+        field_started = true;
+      } else {
+        if ('"' == c && !field_started && field.empty()) {
+          in_quotes = true;
+          field_started = true;
+          field_quoted = true;
+        } else if (c == opts.delimiter_) {
+          row.push_back(field);
+          quoted.push_back(field_quoted);
+          field.clear();
+          field_started = false;
+          field_quoted = false;
+        } else if ('\n' == c || '\r' == c) {
+          if ('\r' == c) {
+            int n = fgetc(fp);
+            if ('\n' != n && EOF != n) ungetc(n, fp);
+          }
+          row.push_back(field);
+          quoted.push_back(field_quoted);
+          field.clear();
+          field_started = false;
+          field_quoted = false;
+          OZ (on_row(row, quoted, line_no));
+          row.clear();
+          quoted.clear();
+          ++line_no;
+        } else {
+          field.push_back((char)c);
+          field_started = true;
+        }
+      }
+    }
+    if (OB_SUCC(ret) && (!field.empty() || !row.empty() || field_started)) {
+      row.push_back(field);
+      quoted.push_back(field_quoted);
+      OZ (on_row(row, quoted, line_no));
+    }
+    if (NULL != fp) {
+      fclose(fp);
+      fp = NULL;
+    }
+  }
+  return ret;
+}
+
+static int file_make_column_name(const std::string &raw, int64_t idx, std::string &out)
+{
+  int ret = OB_SUCCESS;
+  std::string base = raw;
+  if (base.empty()) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "column%ld", (long)idx);
+    base = buf;
+  }
+  out = base;
+  return ret;
+}
+
+static void file_dedup_names(std::vector<std::string> &names)
+{
+  for (size_t i = 0; i < names.size(); ++i) {
+    int suffix = 2;
+    std::string base = names[i];
+    std::string lower_base = file_lower(base);
+    for (size_t j = 0; j < i; ++j) {
+      if (file_lower(names[j]) == lower_base ||
+          file_lower(names[j]) == file_lower(base + "__" + std::to_string(suffix))) {
+        // handled below
+      }
+    }
+    bool dup = true;
+    while (dup) {
+      dup = false;
+      for (size_t j = 0; j < i; ++j) {
+        if (file_lower(names[j]) == file_lower(base)) {
+          dup = true;
+          break;
+        }
+      }
+      if (dup) {
+        base = names[i] + "__" + std::to_string(suffix++);
+      }
+    }
+    names[i] = base;
+  }
+}
+
+static int file_infer_csv_schema(const std::string &path,
+                                 const ObFileOptions &opts,
+                                 ObIAllocator &alloc,
+                                 ObFileTableDef &def)
+{
+  int ret = OB_SUCCESS;
+  std::vector<std::string> names;
+  std::vector<FileCsvColState> states;
+  std::vector<std::vector<std::string>> pending_rows;
+  std::vector<std::vector<bool>> pending_quoted;
+  bool header_decided = opts.header_set_;
+  bool has_header = opts.header_;
+  int64_t data_rows = 0;
+  std::string err_msg;
+
+  auto process_row = [&](const std::vector<std::string> &row,
+                         const std::vector<bool> &quoted,
+                         int64_t line_no) -> int {
+    int ret = OB_SUCCESS;
+    if (names.empty()) {
+      return OB_SUCCESS;
+    }
+    if (row.size() != names.size()) {
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "csv row column count mismatch");
+      LOG_WARN("csv row column count mismatch", K(line_no), K(row.size()), K(names.size()));
+      ret = OB_NOT_SUPPORTED;
+    }
+    for (size_t i = 0; OB_SUCC(ret) && i < names.size(); ++i) {
+      bool is_null = false;
+      std::string val = i < row.size() ? row[i] : std::string();
+      bool q = i < quoted.size() ? quoted[i] : false;
+      ObFileColType t = file_detect_type(val, q, is_null);
+      if (is_null) {
+        states[i].nullable_ = true;
+      } else {
+        states[i].type_ = file_widen_type(states[i].type_, t);
+        if (val.size() > (size_t)states[i].max_len_) {
+          states[i].max_len_ = (int64_t)val.size();
+        }
+      }
+    }
+    if (OB_SUCC(ret)) ++data_rows;
+    return ret;
+  };
+
+  OZ (file_scan_csv(path, opts, [&](const std::vector<std::string> &row,
+                                    const std::vector<bool> &quoted,
+                                    int64_t line_no) -> int {
+    int ret = OB_SUCCESS;
+    if (names.empty() && pending_rows.empty()) {
+      pending_rows.push_back(row);
+      pending_quoted.push_back(quoted);
+    } else if (!header_decided) {
+      // decide header using first two rows
+      const std::vector<std::string> &r0 = pending_rows[0];
+      const std::vector<bool> &q0 = pending_quoted[0];
+      bool first_all_varchar = true;
+      bool first_has_type = false;
+      for (size_t i = 0; i < r0.size(); ++i) {
+        bool is_null = false;
+        ObFileColType t = file_detect_type(r0[i], i < q0.size() ? q0[i] : false, is_null);
+        if (ObFileColType::FILE_COL_VARCHAR != t && !is_null) first_has_type = true;
+        if (ObFileColType::FILE_COL_VARCHAR != t && !is_null) first_all_varchar = false;
+      }
+      bool second_has_type = false;
+      for (size_t i = 0; i < row.size(); ++i) {
+        bool is_null = false;
+        ObFileColType t = file_detect_type(row[i], i < quoted.size() ? quoted[i] : false, is_null);
+        if (ObFileColType::FILE_COL_VARCHAR != t && !is_null) second_has_type = true;
+      }
+      has_header = first_all_varchar && !first_has_type && second_has_type;
+      header_decided = true;
+      if (has_header) {
+        names = r0;
+        file_dedup_names(names);
+      } else {
+        names.resize(r0.size());
+        for (size_t i = 0; i < r0.size(); ++i) {
+          std::string nm;
+          file_make_column_name("", (int64_t)i, nm);
+          names[i] = nm;
+        }
+      }
+      states.resize(names.size());
+      if (has_header) {
+        OZ (process_row(row, quoted, line_no));
+      } else {
+        OZ (process_row(r0, q0, 0));
+        OZ (process_row(row, quoted, line_no));
+      }
+      pending_rows.clear();
+      pending_quoted.clear();
+    } else {
+      OZ (process_row(row, quoted, line_no));
+    }
+    return ret;
+  }));
+
+  if (OB_SUCC(ret) && !header_decided && !pending_rows.empty()) {
+    const std::vector<std::string> &r0 = pending_rows[0];
+    const std::vector<bool> &q0 = pending_quoted[0];
+    bool all_varchar = true;
+    for (size_t i = 0; i < r0.size(); ++i) {
+      bool is_null = false;
+      ObFileColType t = file_detect_type(r0[i], i < q0.size() ? q0[i] : false, is_null);
+      if (ObFileColType::FILE_COL_VARCHAR != t && !is_null) all_varchar = false;
+    }
+    has_header = all_varchar;
+    if (has_header) {
+      names = r0;
+      file_dedup_names(names);
+      states.resize(names.size());
+    } else {
+      names.resize(r0.size());
+      for (size_t i = 0; i < r0.size(); ++i) {
+        std::string nm;
+        file_make_column_name("", (int64_t)i, nm);
+        names[i] = nm;
+      }
+      states.resize(names.size());
+      OZ (process_row(r0, q0, 0));
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    if (names.empty()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "empty csv file is not supported");
+    } else {
+      def.row_count_ = data_rows;
+      for (size_t i = 0; OB_SUCC(ret) && i < names.size(); ++i) {
+        ObFileColumn col;
+        col.type_ = (ObFileColType::FILE_COL_NULL == states[i].type_)
+                    ? ObFileColType::FILE_COL_VARCHAR : states[i].type_;
+        col.nullable_ = states[i].nullable_;
+        col.length_ = (int32_t)states[i].max_len_;
+        if (col.length_ < 1) col.length_ = 1;
+        OZ (ob_write_string(alloc, ObString(names[i].size(), names[i].c_str()), col.name_));
+        OZ (def.cols_.push_back(col));
+      }
+    }
+  }
+  return ret;
+}
+
+static int file_make_data_type(const ObFileColumn &col, ObDataType &dt)
+{
+  int ret = OB_SUCCESS;
+  switch (col.type_) {
+    case ObFileColType::FILE_COL_BOOLEAN:
+      dt.set_obj_type(ObTinyIntType);
+      dt.set_precision(1);
+      break;
+    case ObFileColType::FILE_COL_BIGINT:
+      dt.set_obj_type(ObIntType);
+      dt.set_precision(20);
+      break;
+    case ObFileColType::FILE_COL_DOUBLE:
+      dt.set_obj_type(ObDoubleType);
+      break;
+    case ObFileColType::FILE_COL_DATE:
+      dt.set_obj_type(ObDateType);
+      break;
+    case ObFileColType::FILE_COL_DATETIME:
+      dt.set_obj_type(ObDateTimeType);
+      break;
+    default:
+      dt.set_obj_type(ObVarcharType);
+      dt.set_length(col.length_ > 0 ? col.length_ : 1);
+      dt.set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
+      dt.set_charset_type(CHARSET_UTF8MB4);
+      break;
+  }
+  return ret;
+}
+
+} // namespace
+
 int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableItem *&tbl_item)
 {
   int ret = OB_SUCCESS;
   bool enable_file_sql = false;
-  UNUSED(tbl_item);
-  if (OB_ISNULL(session_info_)) {
+  ObDMLStmt *stmt = get_stmt();
+  ObFileTableDef *def = NULL;
+  TableItem *item = NULL;
+  const ParseNode *args = NULL;
+  const ParseNode *alias_node = NULL;
+  const ParseNode *col_alias_node = NULL;
+  std::string path;
+  std::string format;
+  ObFileOptions opts;
+
+  if (OB_ISNULL(stmt) || OB_ISNULL(allocator_) || OB_ISNULL(session_info_)) {
     ret = OB_NOT_INIT;
   } else if (OB_FAIL(session_info_->get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, enable_file_sql))) {
   } else if (!enable_file_sql) {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "file sql is disabled, set enable_file_sql=on");
+  } else if (parse_tree.num_child_ < 3 || OB_ISNULL(args = parse_tree.children_[0])) {
+    ret = OB_ERR_UNEXPECTED;
   } else {
-    ret = OB_NOT_SUPPORTED;
-    LOG_USER_ERROR(OB_NOT_SUPPORTED, "file table function is not implemented yet");
-    LOG_WARN("file table function is not implemented yet", K(parse_tree.type_));
+    alias_node = parse_tree.children_[1];
+    col_alias_node = parse_tree.children_[2];
+    std::string fname(parse_tree.str_value_, parse_tree.str_len_);
+    std::string lower = file_lower(fname);
+    if (0 == lower.compare("glob")) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "glob is not implemented yet");
+    } else if (0 == lower.compare("read_csv")) {
+      def = static_cast<ObFileTableDef *>(allocator_->alloc(sizeof(ObFileTableDef)));
+      if (OB_ISNULL(def)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        def = new (def) ObFileTableDef();
+        def->format_ = ObFileFormat::FILE_CSV;
+      }
+    } else if (0 == lower.compare("read_json") || 0 == lower.compare("read_ndjson")) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_json is not implemented yet");
+    } else if (0 == lower.compare("read_parquet")) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_parquet is not implemented yet");
+    } else {
+      ret = OB_ERR_PARSE_SQL;
+      LOG_USER_ERROR(OB_ERR_PARSE_SQL, "unknown file table function");
+    }
+  }
+
+  // parse args: flatten link nodes
+  if (OB_SUCC(ret)) {
+    std::vector<const ParseNode *> flat;
+    const ParseNode *cur = args;
+    while (NULL != cur) {
+      if (T_LINK_NODE == cur->type_ && 2 == cur->num_child_) {
+        // left-assoc list: flatten recursively
+        std::vector<const ParseNode *> stack;
+        const ParseNode *n = cur;
+        while (NULL != n && T_LINK_NODE == n->type_ && 2 == n->num_child_) {
+          stack.push_back(n->children_[1]);
+          n = n->children_[0];
+        }
+        if (NULL != n) flat.push_back(n);
+        for (int64_t i = (int64_t)stack.size() - 1; i >= 0; --i) flat.push_back(stack[i]);
+        break;
+      } else {
+        flat.push_back(cur);
+        break;
+      }
+    }
+    bool first = true;
+    for (size_t i = 0; OB_SUCC(ret) && i < flat.size(); ++i) {
+      const ParseNode *arg = flat[i];
+      if (OB_ISNULL(arg)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (T_OP_EQ == arg->type_ && 2 == arg->num_child_ &&
+                 NULL != arg->children_[0] && T_COLUMN_REF == arg->children_[0]->type_) {
+        const ParseNode *name_node = arg->children_[0];
+        const char *name_ptr = NULL;
+        int64_t name_len = 0;
+        if (name_node->num_child_ >= 3 && NULL != name_node->children_[2]) {
+          name_ptr = name_node->children_[2]->str_value_;
+          name_len = name_node->children_[2]->str_len_;
+        }
+        std::string name(name_ptr ? name_ptr : "", name_len);
+        std::string lname = file_lower(name);
+        const ParseNode *val = arg->children_[1];
+        if (0 == lname.compare("header")) {
+          opts.header_set_ = true;
+          opts.header_ = (NULL != val && T_BOOL == val->type_) ? (val->value_ != 0) : true;
+        } else if (0 == lname.compare("sample_size")) {
+          if (NULL == val || T_INT != val->type_ || -1 != val->value_) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "sample_size only supports -1");
+          }
+        } else if (0 == lname.compare("delimiter") || 0 == lname.compare("delim") ||
+                   0 == lname.compare("sep") || 0 == lname.compare("quote") ||
+                   0 == lname.compare("escape") || 0 == lname.compare("nullstr")) {
+          if (NULL == val || (T_VARCHAR != val->type_ && T_CHAR != val->type_)) {
+            ret = OB_ERR_PARSE_SQL;
+            LOG_USER_ERROR(OB_ERR_PARSE_SQL, "file option requires a string");
+          } else if (0 == lname.compare("nullstr")) {
+            opts.nullstr_.assign_ptr(val->str_value_, (int32_t)val->str_len_);
+          } else if (val->str_len_ != 1) {
+            ret = OB_ERR_PARSE_SQL;
+            LOG_USER_ERROR(OB_ERR_PARSE_SQL, "file option requires a single char");
+          } else if (0 == lname.compare("quote")) {
+            opts.quote_ = val->str_value_[0];
+          } else if (0 == lname.compare("escape")) {
+            opts.escape_ = val->str_value_[0];
+          } else {
+            opts.delimiter_ = val->str_value_[0];
+          }
+        } else {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "unknown file table option");
+        }
+      } else if (first) {
+        if (T_VARCHAR != arg->type_ && T_CHAR != arg->type_) {
+          ret = OB_ERR_PARSE_SQL;
+          LOG_USER_ERROR(OB_ERR_PARSE_SQL, "file path must be a string literal");
+        } else {
+          path.assign(arg->str_value_, arg->str_len_);
+          first = false;
+        }
+      } else if (T_VARCHAR == arg->type_ || T_CHAR == arg->type_) {
+        format.assign(arg->str_value_, arg->str_len_);
+        std::string lf = file_lower(format);
+        if (0 != lf.compare("csv")) {
+          ret = OB_ERR_PARSE_SQL;
+          LOG_USER_ERROR(OB_ERR_PARSE_SQL, "unknown file format");
+        }
+      } else {
+        ret = OB_ERR_PARSE_SQL;
+        LOG_USER_ERROR(OB_ERR_PARSE_SQL, "invalid file table argument");
+      }
+    }
+  }
+
+  // path security + schema
+  if (OB_SUCC(ret)) {
+    char real_path[PATH_MAX];
+    if (path.empty() || '/' != path[0]) {
+      ret = OB_ERR_NO_PRIVILEGE;
+      LOG_USER_ERROR(OB_ERR_NO_PRIVILEGE, "file path must be absolute");
+    } else if (std::string::npos != path.find("..")) {
+      ret = OB_ERR_NO_PRIVILEGE;
+      LOG_USER_ERROR(OB_ERR_NO_PRIVILEGE, "file path must not contain ..");
+    } else if (NULL == realpath(path.c_str(), real_path)) {
+      ret = OB_FILE_NOT_EXIST;
+      LOG_USER_ERROR(OB_FILE_NOT_EXIST, "file not found");
+    } else {
+      struct stat st;
+      if (0 != stat(real_path, &st) || !S_ISREG(st.st_mode)) {
+        ret = OB_ERR_NO_PRIVILEGE;
+        LOG_USER_ERROR(OB_ERR_NO_PRIVILEGE, "file must be a regular file");
+      } else {
+        ObString secure_priv;
+        if (OB_FAIL(session_info_->get_secure_file_priv(secure_priv))) {
+        } else if (OB_FAIL(ObResolverUtils::check_secure_path(secure_priv, ObString(strlen(real_path), real_path)))) {
+        } else {
+          OZ (ob_write_string(*allocator_, ObString((int32_t)strlen(real_path), real_path), def->path_));
+          def->fp_.dev_ = st.st_dev;
+          def->fp_.ino_ = st.st_ino;
+          def->fp_.size_ = st.st_size;
+          def->fp_.mtime_sec_ = st.st_mtime;
+          def->fp_.mtime_nsec_ = 0;
+          def->fp_.valid_ = true;
+          OZ (file_infer_csv_schema(std::string(real_path), opts, *allocator_, *def));
+          OX (def->opts_ = opts);
+        }
+      }
+    }
+  }
+
+  // create table item
+  if (OB_SUCC(ret)) {
+    ObString alias_name;
+    if (NULL != alias_node) {
+      alias_name.assign_ptr(alias_node->str_value_, (int32_t)alias_node->str_len_);
+    }
+    if (OB_ISNULL(item = stmt->create_table_item(*allocator_))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      item->type_ = TableItem::FILE_TABLE;
+      item->table_id_ = generate_table_id();
+      item->file_table_def_ = def;
+      if (!alias_name.empty()) {
+        OZ (ob_write_string(*allocator_, alias_name, item->table_name_));
+        OZ (ob_write_string(*allocator_, alias_name, item->alias_name_));
+      } else {
+        OZ (ob_write_string(*allocator_, ObString(parse_tree.str_len_, parse_tree.str_value_), item->table_name_));
+        OZ (ob_write_string(*allocator_, item->table_name_, item->alias_name_));
+      }
+      OZ (stmt->add_table_item(session_info_, item));
+      tbl_item = item;
+    }
+  }
+
+  // columns
+  if (OB_SUCC(ret) && NULL != item) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < def->cols_.count(); ++i) {
+      ObColumnRefRawExpr *col_expr = NULL;
+      ColumnItem column_item;
+      ObDataType dt;
+      ObRawExprResType result_type;
+      ObFileColumn &fcol = def->cols_.at(i);
+      OZ (file_make_data_type(fcol, dt));
+      OZ (params_.expr_factory_->create_raw_expr(T_REF_COLUMN, col_expr));
+      CK (OB_NOT_NULL(col_expr));
+      OX (col_expr->set_ref_id(item->table_id_, OB_APP_MIN_COLUMN_ID + i));
+      OX (result_type.set_meta(dt.get_meta_type()));
+      OX (result_type.set_accuracy(dt.get_accuracy()));
+      OX (col_expr->set_result_type(result_type));
+      OX (col_expr->set_column_name(fcol.name_));
+      OX (col_expr->set_column_attr(item->get_object_name(), fcol.name_));
+      OX (column_item.expr_ = col_expr);
+      OX (column_item.table_id_ = item->table_id_);
+      OX (column_item.column_id_ = OB_APP_MIN_COLUMN_ID + i);
+      OX (column_item.column_name_ = fcol.name_);
+      OZ (col_expr->extract_info());
+      OZ (stmt->add_column_item(column_item));
+    }
   }
   return ret;
 }
-
 int ObDMLResolver::resolve_json_table_item(const ParseNode &parse_tree, TableItem *&tbl_item)
 {
   int ret = OB_SUCCESS;
