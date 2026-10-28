@@ -57,7 +57,7 @@
 %destructor {destroy_tree($$);}<node>
 %destructor {oceanbase::common::ob_free($$);}<str_value_>
 
-%expect 8
+%expect 8 /* file_table_expr: shift on '(' / alias is intended; see review note */
 
 %token <node> NAME_OB
 %token <node> STRING_VALUE
