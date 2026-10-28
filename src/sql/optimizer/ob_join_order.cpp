@@ -8432,6 +8432,7 @@ int ObJoinOrder::generate_file_table_paths()
     } else if (OB_FAIL(file_path->estimate_cost())) {
     } else if (OB_FAIL(file_path->compute_pipeline_info())) {
     } else if (OB_FAIL(create_plan_for_path_with_subq(file_path))) {
+    } else if (OB_FAIL(add_path(file_path))) {
     }
   }
   return ret;

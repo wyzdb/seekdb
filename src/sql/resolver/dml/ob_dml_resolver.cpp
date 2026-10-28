@@ -3097,7 +3097,7 @@ int ObDMLResolver::resolve_single_table_column_item(const TableItem &table_item,
   } else if (table_item.is_json_table()) {
     if (OB_FAIL(resolve_json_table_column_item(table_item, column_name, col_item))) {
     }
-  } else if (table_item.is_values_table()) {
+  } else if (table_item.is_values_table() || table_item.is_file_table()) {
     if (OB_ISNULL(col_item = stmt->get_column_item(table_item.table_id_, column_name))) {
       ret = OB_ERR_BAD_FIELD_ERROR;
     }
@@ -4098,8 +4098,8 @@ static int file_infer_csv_schema(const std::string &path,
   std::vector<FileCsvColState> states;
   std::vector<std::vector<std::string>> pending_rows;
   std::vector<std::vector<bool>> pending_quoted;
-  bool header_decided = opts.header_set_;
-  bool has_header = opts.header_;
+  bool header_decided = false;
+  bool has_header = false;
   int64_t data_rows = 0;
   std::string err_msg;
 
@@ -4158,7 +4158,8 @@ static int file_infer_csv_schema(const std::string &path,
         ObFileColType t = file_detect_type(row[i], i < quoted.size() ? quoted[i] : false, is_null);
         if (ObFileColType::FILE_COL_VARCHAR != t && !is_null) second_has_type = true;
       }
-      has_header = first_all_varchar && !first_has_type && second_has_type;
+      has_header = opts.header_set_ ? opts.header_
+                                    : (first_all_varchar && !first_has_type && second_has_type);
       header_decided = true;
       if (has_header) {
         names = r0;
@@ -4195,7 +4196,7 @@ static int file_infer_csv_schema(const std::string &path,
       ObFileColType t = file_detect_type(r0[i], i < q0.size() ? q0[i] : false, is_null);
       if (ObFileColType::FILE_COL_VARCHAR != t && !is_null) all_varchar = false;
     }
-    has_header = all_varchar;
+    has_header = opts.header_set_ ? opts.header_ : all_varchar;
     if (has_header) {
       names = r0;
       file_dedup_names(names);
@@ -4258,7 +4259,9 @@ static int file_make_data_type(const ObFileColumn &col, ObDataType &dt)
       dt.set_obj_type(ObVarcharType);
       dt.set_length(col.length_ > 0 ? col.length_ : 1);
       dt.set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
+      dt.set_collation_level(CS_LEVEL_IMPLICIT);
       dt.set_charset_type(CHARSET_UTF8MB4);
+      dt.set_length_semantics(LS_CHAR);
       break;
   }
   return ret;
@@ -4279,6 +4282,7 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
   std::string path;
   std::string format;
   ObFileOptions opts;
+  int stage = 0;
 
   if (OB_ISNULL(stmt) || OB_ISNULL(allocator_) || OB_ISNULL(session_info_)) {
     ret = OB_NOT_INIT;
@@ -4317,6 +4321,7 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
   }
 
   // parse args: flatten link nodes
+  stage = 1;
   if (OB_SUCC(ret)) {
     std::vector<const ParseNode *> flat;
     const ParseNode *cur = args;
@@ -4358,7 +4363,17 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
           opts.header_set_ = true;
           opts.header_ = (NULL != val && T_BOOL == val->type_) ? (val->value_ != 0) : true;
         } else if (0 == lname.compare("sample_size")) {
-          if (NULL == val || T_INT != val->type_ || -1 != val->value_) {
+          int64_t sample_size = 0;
+          bool valid = false;
+          if (NULL != val && T_INT == val->type_) {
+            sample_size = val->value_;
+            valid = true;
+          } else if (NULL != val && T_OP_NEG == val->type_ && 1 == val->num_child_ &&
+                     NULL != val->children_[0] && T_INT == val->children_[0]->type_) {
+            sample_size = -val->children_[0]->value_;
+            valid = true;
+          }
+          if (!valid || -1 != sample_size) {
             ret = OB_NOT_SUPPORTED;
             LOG_USER_ERROR(OB_NOT_SUPPORTED, "sample_size only supports -1");
           }
@@ -4385,28 +4400,29 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "unknown file table option");
         }
       } else if (first) {
-        if (T_VARCHAR != arg->type_ && T_CHAR != arg->type_) {
-          ret = OB_ERR_PARSE_SQL;
-          LOG_USER_ERROR(OB_ERR_PARSE_SQL, "file path must be a string literal");
+        ObString path_str;
+        if (OB_FAIL(resolve_str_const(*arg, path_str))) {
         } else {
-          path.assign(arg->str_value_, arg->str_len_);
+          path.assign(path_str.ptr(), path_str.length());
           first = false;
         }
-      } else if (T_VARCHAR == arg->type_ || T_CHAR == arg->type_) {
-        format.assign(arg->str_value_, arg->str_len_);
-        std::string lf = file_lower(format);
-        if (0 != lf.compare("csv")) {
-          ret = OB_ERR_PARSE_SQL;
-          LOG_USER_ERROR(OB_ERR_PARSE_SQL, "unknown file format");
-        }
       } else {
-        ret = OB_ERR_PARSE_SQL;
-        LOG_USER_ERROR(OB_ERR_PARSE_SQL, "invalid file table argument");
+        ObString fmt_str;
+        if (OB_FAIL(resolve_str_const(*arg, fmt_str))) {
+        } else {
+          format.assign(fmt_str.ptr(), fmt_str.length());
+          std::string lf = file_lower(format);
+          if (0 != lf.compare("csv")) {
+            ret = OB_ERR_PARSE_SQL;
+            LOG_USER_ERROR(OB_ERR_PARSE_SQL, "unknown file format");
+          }
+        }
       }
     }
   }
 
   // path security + schema
+  stage = 2;
   if (OB_SUCC(ret)) {
     char real_path[PATH_MAX];
     if (path.empty() || '/' != path[0]) {
@@ -4435,6 +4451,7 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
           def->fp_.mtime_sec_ = st.st_mtime;
           def->fp_.mtime_nsec_ = 0;
           def->fp_.valid_ = true;
+          stage = 3;
           OZ (file_infer_csv_schema(std::string(real_path), opts, *allocator_, *def));
           OX (def->opts_ = opts);
         }
@@ -4443,6 +4460,7 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
   }
 
   // create table item
+  stage = 4;
   if (OB_SUCC(ret)) {
     ObString alias_name;
     if (NULL != alias_node) {
@@ -4467,6 +4485,7 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
   }
 
   // columns
+  stage = 5;
   if (OB_SUCC(ret) && NULL != item) {
     for (int64_t i = 0; OB_SUCC(ret) && i < def->cols_.count(); ++i) {
       ObColumnRefRawExpr *col_expr = NULL;
@@ -4490,6 +4509,9 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
       OZ (col_expr->extract_info());
       OZ (stmt->add_column_item(column_item));
     }
+  }
+  if (OB_FAIL(ret)) {
+    LOG_WARN("resolve file table failed", K(ret), K(stage));
   }
   return ret;
 }

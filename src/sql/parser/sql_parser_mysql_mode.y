@@ -16650,10 +16650,12 @@ relation_factor '(' file_table_arg_list ')' file_table_alias
 file_table_arg_list:
 expr
 {
+  $1->is_forbid_parameter_ = 1;
   $$ = $1;
 }
 | file_table_arg_list ',' expr
 {
+  $3->is_forbid_parameter_ = 1;
   malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
 }
 ;
