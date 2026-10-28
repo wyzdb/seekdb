@@ -251,6 +251,13 @@ ObLogicalOperator *ObLogOperatorFactory::allocate(ObLogPlan &plan, ObLogOpType t
     } else { /* do nothing */ }
     break;
   }
+  case LOG_FILE_SCAN: {
+    ptr = allocator_.alloc(sizeof(ObLogFileScan));
+    if (NULL != ptr) {
+      ret_op = new (ptr) ObLogFileScan(plan);
+    } else { /* do nothing */ }
+    break;
+  }
   case LOG_TEMP_TABLE_INSERT: {
     ptr = allocator_.alloc(sizeof(ObLogTempTableInsert));
     if (NULL != ptr) {
